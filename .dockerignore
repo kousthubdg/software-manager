@@ -1,0 +1,12 @@
+# Whitelist: only sources and build scripts go into the image
+*
+!src/
+!build/Dockerfile
+!build/scripts/
+src/**/__pycache__/
+src/**/.env
+src/.env
+src/node_modules/
+src/dist/
+src/**/node_modules/
+src/frontend/dist/

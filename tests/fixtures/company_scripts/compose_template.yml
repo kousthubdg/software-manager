@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+  crowding_controller:
+    container_name: {{container_name}}
+    image: {{registry_server}}/{{image}}:{{version}}
+    network_mode: host
+    init: true
+    tty: true
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        cd /opt/CrowdingController
+        exec python3 -m ServiceMain Configs/
+    restart: unless-stopped
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - type: bind
+        source: {{data_file_path}}/serviceslog/crowding_controller
+        target: /opt/CrowdingController/Configs/log
+      - type: bind
+        source: {{data_file_path}}/data
+        target: /data
+        read_only: true
+    env_file:
+      - {{data_file_path}}/{{container_name}}.env

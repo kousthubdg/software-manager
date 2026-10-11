@@ -1,0 +1,12 @@
+buildType: production
+moduleName: software-manager
+imageName: software-manager
+version: 1.0.0
+buildImageName: software-manager
+buildImageversion: build
+datafilename: software-manager.tar
+datafileversion: 1.0.0
+hostPort: 2999
+containerPort: 2999
+registry:
+scriptsVersion: 1.0.0

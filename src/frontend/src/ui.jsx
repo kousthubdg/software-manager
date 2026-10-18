@@ -76,9 +76,9 @@ export const fmtBytes = (n) => {
 const TONE = {
   ok: ['downloaded', 'running', 'online', 'healthy', 'succeeded', 'scanned', 'ok', 'up', 'enabled', 'on'],
   busy: ['scanning', 'downloading', 'installing', 'updating', 'queued', 'starting', 'deleting', 'restarting', 'building',
-    'running_job'],
+    'running_job', 're-uploading'],
   warn: ['uploaded', 'prepared', 'partial', 'interrupted', 'unknown', 'created', 'stopped'],
-  info: ['available'],
+  info: ['available', 'update'],
   bad: ['failed', 'scan_failed', 'download_failed', 'offline', 'unhealthy', 'exited', 'dead', 'missing',
     'crashloop', 'error', 'conflict'],
 }

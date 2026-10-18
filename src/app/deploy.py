@@ -278,6 +278,7 @@ def pod_spec(dep: dict, version: str, pod: str, map_doc: Optional[dict] = None) 
     src = res.get("image_source") or inst.image_source
     spec = {
         "name": pod, "order": order, "release": version, "image_source": src, "digest": res.get("digest", ""),
+        "image_id": res.get("image_id", ""),
         "image_tar_url": url("image") if src == "tar" else "",
         "image_tar_md5": res.get("image_tar_md5", ""),
         "registry_auth": registry.docker_auth(inst.registry_server) if inst.registry_server and src != "tar" else None,
@@ -336,6 +337,11 @@ def busy(dep_id: int) -> Optional[int]:
 def create_job(dep_id: Optional[int], kind: str, steps: list[dict], params: dict, user: str,
                dep_state: Optional[str] = None) -> int:
     """dep_state is set on the deployment only once the deployment lock is held (a 409 leaves it unchanged)."""
+    versions = {s["version"] for s in steps if s.get("version")} | {_dep(dep_id).get("version") or ""}
+    for v in sorted(versions - {""}):
+        r = db.one("SELECT reupload_json FROM releases WHERE version=?", v)
+        if r and r["reupload_json"]:
+            raise HTTPException(409, f"release {v} is being re-uploaded; try again when it has finished")
     for i, s in enumerate(steps):
         s.setdefault("id", i)
         s.setdefault("status", "pending")
@@ -538,7 +544,7 @@ def run_job(job_id: int, resume: bool = False) -> None:
             _save_job(job_id, steps_json=steps)
             if failed:
                 break
-        if failed and job["kind"] in ("update", "rollback", "apply_map"):
+        if failed and job["kind"] in ("update", "rollback", "apply_map", "reupload_apply"):
             _compensate(job_id, steps)
             _save_job(job_id, status="failed", finished_at=time.time(), steps_json=steps)
             if dep_id:
@@ -626,13 +632,39 @@ def _ordered(version: str, map_doc: dict) -> list[tuple[str, int]]:
     return [(i.name, pl[i.name]) for i in pods_of(m) if i.name in pl]
 
 
+def _installed(r: dict) -> str:
+    """What a deployment is installed from: kept so a later re-upload of the same version can be compared."""
+    return json.dumps({"manifest_text": r["manifest_text"], "resolved_json": r["resolved_json"] or "{}"})
+
+
+def pending_changes(dep: dict) -> Optional[dict]:
+    """Pods that differ between what the deployment was installed from and its (re-uploaded) release now."""
+    snap = json.loads(dep.get("installed_json") or "{}")
+    r = db.one("SELECT * FROM releases WHERE version=?", dep["version"])
+    if not snap or not r or r["status"] != "downloaded" or r["reupload_json"]:
+        return None
+    old_m, _e, _w = manifest.parse(snap["manifest_text"])
+    new_m, _e, _w = manifest.parse(r["manifest_text"])
+    if not old_m or not new_m:
+        return None
+    d = manifest.diff(old_m, new_m, releases.pod_fingerprints(json.loads(snap["resolved_json"] or "{}")),
+                      releases.pod_fingerprints(json.loads(r["resolved_json"] or "{}")))
+    deployed = set(placement(json.loads(dep["map_json"])))
+    pods = {i.name for i in pods_of(new_m)} | {i.name for i in pods_of(old_m)}
+    out = {k: [p for p in d[k] if p in pods and (k == "added" or p in deployed)] for k in ("changed", "added", "removed")}
+    if not any(out.values()):
+        return None
+    return {**out, "revision": r["revision"], "uploaded_at": r["uploaded_at"], "uploaded_by": r["uploaded_by"]}
+
+
 def wf_install(dep: dict, user: str) -> int:
     mp = json.loads(dep["map_json"])
+    r, _m = _load(dep["version"])
     order = _ordered(dep["version"], mp)
     steps = _node_steps(mp)
     steps += [{"kind": "prepare", "pod": p, "node_id": n, "version": dep["version"]} for p, n in order]
     steps += [{"kind": "start", "pod": p, "node_id": n, "version": dep["version"]} for p, n in order]
-    steps.append({"kind": "finalize", "set": {"state": "running"}})
+    steps.append({"kind": "finalize", "set": {"state": "running", "installed_json": _installed(r)}})
     return create_job(dep["id"], "install", steps, {}, user, dep_state="installing")
 
 
@@ -650,19 +682,34 @@ def wf_action(dep: dict, action: str, user: str, pods: Optional[list[str]] = Non
 
 
 def wf_update(dep: dict, to_version: str, user: str, new_map: Optional[dict] = None, kind: str = "update") -> int:
+    """to_version == current version applies a re-upload of that version (only the pods whose content changed).
+    The image tag is the same then, so a failed pod cannot be rolled back automatically."""
+    same = to_version == dep["version"]
     old_r, old_m = _load(dep["version"], "current release")
+    old_resolved = old_r["resolved_json"] or "{}"
+    snap = json.loads(dep.get("installed_json") or "{}")
+    if snap:
+        m, _e, _w = manifest.parse(snap["manifest_text"])
+        if m:
+            old_m, old_resolved = m, snap["resolved_json"] or "{}"
     new_r, new_m = _load(to_version)
     if new_r["status"] != "downloaded":
         raise HTTPException(422, f"release {to_version} is not downloaded")
     if new_m.software_name != old_m.software_name:
         raise HTTPException(422, "cannot update to a different software_name")
     mp = new_map or json.loads(dep["map_json"])
+    if not new_map:
+        keep = {i.name for i in pods_of(new_m)}
+        mp = {**mp, "nodes": [{**row, "pods": [p for p in row.get("pods", []) if p in keep]}
+                              for row in mp.get("nodes", [])]}
     v = validate(to_version, mp, dep["alarm_base_path"], exclude_dep=dep["id"])
     if not v["ok"]:
         raise HTTPException(422, "; ".join(v["errors"]))
-    od = {k: x.get("digest", "") for k, x in json.loads(old_r["resolved_json"] or "{}").items()}
-    nd = {k: x.get("digest", "") for k, x in json.loads(new_r["resolved_json"] or "{}").items()}
+    od = releases.pod_fingerprints(json.loads(old_resolved))
+    nd = releases.pod_fingerprints(json.loads(new_r["resolved_json"] or "{}"))
     diff = manifest.diff(old_m, new_m, od, nd)
+    if same and not (diff["changed"] or diff["added"] or diff["removed"]) and mp == json.loads(dep["map_json"]):
+        raise HTTPException(422, f"nothing changed in release {to_version} since this deployment was installed")
     old_map = json.loads(dep["map_json"])
     old_pl, new_pl = placement(old_map), placement(mp)
     steps = _node_steps(mp)
@@ -670,8 +717,9 @@ def wf_update(dep: dict, to_version: str, user: str, new_map: Optional[dict] = N
         steps.append({"kind": "backup", "pod": DB_POD, "node_id": old_pl[DB_POD]})
     for p, n in _ordered(to_version, mp):
         if p in diff["changed"]:
-            steps.append({"kind": "prepare", "pod": p, "node_id": n, "version": to_version, "compensate": "rollback"})
-            steps.append({"kind": "start", "pod": p, "node_id": n, "version": to_version, "compensate": "rollback"})
+            comp = None if same else "rollback"
+            steps.append({"kind": "prepare", "pod": p, "node_id": n, "version": to_version, "compensate": comp})
+            steps.append({"kind": "start", "pod": p, "node_id": n, "version": to_version, "compensate": comp})
         elif p in diff["added"]:
             steps.append({"kind": "prepare", "pod": p, "node_id": n, "version": to_version, "compensate": "down"})
             steps.append({"kind": "start", "pod": p, "node_id": n, "version": to_version, "compensate": "down"})
@@ -680,10 +728,12 @@ def wf_update(dep: dict, to_version: str, user: str, new_map: Optional[dict] = N
             steps.append({"kind": "down", "pod": p, "node_id": old_pl[p], "remove_images": True})
     for nid in sorted(set(new_pl.values())):
         steps.append({"kind": "prune", "node_id": nid})
-    steps.append({"kind": "finalize", "set": {"version": to_version, "prev_version": dep["version"],
-                                              "state": "running", "map_json": json.dumps(mp)}})
-    return create_job(dep["id"], kind, steps, {"from": dep["version"], "to": to_version, "diff": diff, "map": mp}, user,
-                      dep_state="updating")
+    fin = {"version": to_version, "prev_version": dep["prev_version"] if same else dep["version"],
+           "state": "running", "map_json": json.dumps(mp), "installed_json": _installed(new_r)}
+    steps.append({"kind": "finalize", "set": fin})
+    return create_job(dep["id"], "reupload_apply" if same else kind, steps,
+                      {"from": dep["version"], "to": to_version, "diff": diff, "map": mp,
+                       "revision": new_r["revision"]}, user, dep_state="updating")
 
 
 def wf_apply_map(dep: dict, new_map: dict, user: str) -> int:

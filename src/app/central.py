@@ -56,7 +56,7 @@ def check_catalog_key(key: Optional[str]) -> bool:
 
 def _meta(r: dict) -> dict:
     return {k: r[k] for k in ("version", "software_name", "description", "manifest_text", "manifest_sha256",
-                              "uploaded_by", "uploaded_at", "scan_json", "resolved_json")}
+                              "uploaded_by", "uploaded_at", "scan_json", "resolved_json", "revision")}
 
 
 def catalog() -> list[dict]:
@@ -68,7 +68,8 @@ def catalog() -> list[dict]:
         files = catalog_files(r["version"])
         out.append({"version": r["version"], "software_name": r["software_name"], "description": r["description"],
                     "manifest_sha256": r["manifest_sha256"], "uploaded_at": r["uploaded_at"],
-                    "size": sum(f["size"] for f in files), "files": len(files)})
+                    "content_sha256": releases.content_sha256(r["manifest_sha256"], r["resolved_json"]),
+                    "revision": r["revision"], "size": sum(f["size"] for f in files), "files": len(files)})
     return out
 
 
@@ -156,7 +157,23 @@ def status() -> dict:
 
 
 def _local(version: str) -> Optional[dict]:
-    return db.one("SELECT status, manifest_sha256, software_name FROM releases WHERE version=?", version)
+    return db.one("SELECT status, manifest_sha256, software_name, uploaded_at, resolved_json, revision "
+                  "FROM releases WHERE version=?", version)
+
+
+def _state_for(it: dict, loc: Optional[dict]) -> str:
+    """available | downloaded | update (the office re-uploaded a version we have) | conflict | <local status>."""
+    if not loc:
+        return "available"
+    remote = it.get("content_sha256")
+    same = loc["manifest_sha256"] == it.get("manifest_sha256") and (
+        not remote or remote == releases.content_sha256(loc["manifest_sha256"], loc["resolved_json"]))
+    if same:
+        return loc["status"]
+    if loc["software_name"] == it.get("software_name") and loc["status"] == "downloaded" \
+            and float(it.get("uploaded_at") or 0) > float(loc["uploaded_at"] or 0):
+        return "update"
+    return "conflict"
 
 
 def check_once() -> None:
@@ -185,21 +202,15 @@ def check_once() -> None:
         if not isinstance(v, str) or not manifest.VER_RE.match(v):
             continue
         loc = _local(v)
-        if not loc:
-            state = "available"
-        elif loc["manifest_sha256"] == it.get("manifest_sha256") and loc["status"] == "downloaded":
-            state = "downloaded"
-        elif loc["manifest_sha256"] == it.get("manifest_sha256"):
-            state = loc["status"]
-        else:
-            state = "conflict"
+        state = _state_for(it, loc)
         avail.append({**{k: it.get(k) for k in ("version", "software_name", "description", "manifest_sha256",
-                                                 "uploaded_at", "size")}, "state": state})
+                                                 "content_sha256", "uploaded_at", "revision", "size")},
+                      "state": state, "local_uploaded_at": loc["uploaded_at"] if loc else None})
     with _lock:
         _state.update(last_check=time.time(), error="", available=avail)
     if settings.sm_central_auto_download:
         for a in avail:
-            if a["state"] == "available":
+            if a["state"] in ("available", "update"):
                 start_download(a["version"], "auto")
 
 
@@ -208,7 +219,10 @@ def start_download(version: str, user: str) -> bool:
         raise ValueError("bad version")
     loc = _local(version)
     if loc:
-        raise ValueError(f"version {version} already exists here ({loc['status']})")
+        with _lock:
+            known = next((a for a in _state["available"] if a["version"] == version), None)
+        if not known or known["state"] != "update":
+            raise ValueError(f"version {version} already exists here ({loc['status']})")
     with _lock:
         if version in _state["progress"] and _state["progress"][version].get("state") == "downloading":
             return False
@@ -271,7 +285,7 @@ def _download(version: str) -> None:
             tmp.replace(final)
             res = [x for x in releases.import_local() if x["version"] in (version, final.name)]
             result = res[0]["result"] if res else "not imported"
-            if result not in ("imported", "already here"):
+            if result not in ("imported", "updated", "already here"):
                 shutil.rmtree(final, ignore_errors=True)
                 raise RuntimeError(f"import: {result}")
             _prog(version, state="downloaded", current="")

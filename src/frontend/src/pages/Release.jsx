@@ -51,13 +51,15 @@ function ReleaseDetail({ version, onDeleted, onClose }) {
         <button className="icon" title="Close details" aria-label="Close details" onClick={onClose}><X size={16} /></button>
       </>}>
       <div className="kv">
-        <div><b>Uploaded</b> {fmtTime(rel.uploaded_at)} by {rel.uploaded_by}</div>
+        <div><b>Uploaded</b> {fmtTime(rel.uploaded_at)} by {rel.uploaded_by}{rel.revision > 1 ? ` · revision ${rel.revision}` : ''}</div>
         <div><b>Manifest sha256</b> <span className="mono small">{rel.manifest_sha256?.slice(0, 16)}…</span></div>
         <div><b>Used by</b> {inUse ? rel.used_by.join(', ') : 'No deployment'}</div>
         {rel.progress?.phase && <div><b>Progress</b>
           <Progress done={rel.progress.done ?? 0} total={rel.progress.total ?? 0}
             label={`${rel.progress.phase} ${rel.progress.done ?? 0}/${rel.progress.total ?? 0}${rel.progress.current ? ` · ${rel.progress.current}` : ''}`} /></div>}
       </div>
+      {rel.reuploading && <Msg info={`Re-uploading ${rel.version}: deployments keep using the stored copy until the new one is checked and stored.`} />}
+      {rel.progress?.reupload_error && <Msg error={`Re-upload failed ${fmtTime(rel.progress.reupload_failed_at)}; the previous copy was kept. ${rel.progress.reupload_error}`} />}
       <Msg error={error || rel.progress?.error} warnings={[...(scan.warnings || []),
         ...(scan.installers || []).flatMap((x) => (x.warnings || []).map((w) => `${x.name}: ${w}`))]} />
       <div className="mt" style={{ overflowX: 'auto' }}>
@@ -88,6 +90,17 @@ function ReleaseDetail({ version, onDeleted, onClose }) {
   )
 }
 
+function confirmReupload({ version, uploaded_at, uploaded_by }) {
+  return confirmDialog({
+    title: `Re-upload release ${version}?`,
+    message: `You are re-uploading ${version} (stored ${fmtTime(uploaded_at)}${uploaded_by ? ` by ${uploaded_by}` : ''}). `
+      + 'Every image and scripts tar is checked and stored again, so a re-pushed image or an added service is picked up. '
+      + 'The stored copy stays in use until the new one is ready; if anything fails it is kept. '
+      + `Deployments on ${version} then offer "Apply changes".`,
+    confirmLabel: `Re-upload ${version}`,
+  })
+}
+
 function ReleasePath({ onPick, reloadList }) {
   const [src, reload, loadError] = usePoll(() => api('/api/release-source'), 5000)
   const [folder, setFolder] = useState('')
@@ -96,17 +109,29 @@ function ReleasePath({ onPick, reloadList }) {
   const [busy, run] = useAction(setError)
   const items = src?.releases || []
   const cur = items.find((x) => x.folder === folder)
+  const stored = cur?.status === 'downloaded'
 
-  const doUpload = () => run(async () => {
-    setError('')
-    setOk('')
-    const res = await api(`/api/release-source/${encodeURIComponent(folder)}/import`, { method: 'POST', body: { download: true } })
-    setOk(res.status === 'downloaded' ? `Release ${res.version} is already stored at this Software Manager.`
-      : `Release ${res.version}: checking, then storing every service (scripts + image). Progress is in the table below.`)
-    onPick(res.version)
-    reload()
-    reloadList()
-  })
+  const doUpload = async () => {
+    if (stored && !await confirmReupload(cur)) return
+    run(async () => {
+      setError('')
+      setOk('')
+      const path = `/api/release-source/${encodeURIComponent(folder)}/import`
+      let res
+      try {
+        res = await api(path, { method: 'POST', body: { download: true, replace: stored } })
+      } catch (e) {
+        if (!e.data?.exists || !await confirmReupload(e.data)) throw e
+        res = await api(path, { method: 'POST', body: { download: true, replace: true } })
+      }
+      setOk(res.reupload ? `Re-uploading ${res.version}: checking, then storing every service again. The previous copy stays in use until this finishes.`
+        : res.status === 'downloaded' ? `Release ${res.version} is already stored at this Software Manager.`
+          : `Release ${res.version}: checking, then storing every service (scripts + image). Progress is in the table below.`)
+      onPick(res.version)
+      reload()
+      reloadList()
+    })
+  }
 
   if (src && !src.exists) {
     return <Empty title="Release path not mounted">The release path <code>{src.root}</code> is not available on this host (SM_RELEASE_SOURCE).</Empty>
@@ -129,18 +154,21 @@ function ReleasePath({ onPick, reloadList }) {
           </select>
         </label>
         {can('operator') && (
-          <button className="primary" disabled={busy || !cur?.version || ['downloaded', 'downloading', 'scanning'].includes(cur?.status)}
-            onClick={doUpload}><Upload size={15} /> Upload</button>
+          <button className="primary" disabled={busy || !cur?.version || cur?.reuploading || ['downloading', 'scanning', 'uploaded'].includes(cur?.status)}
+            title={stored ? `Check and store ${cur.version} again from this folder` : undefined}
+            onClick={doUpload}>{stored ? <><RefreshCw size={15} /> Re-upload {cur.version}</> : <><Upload size={15} /> Upload</>}</button>
         )}
       </div>
       {cur && (
         <div className="kv mt">
           <div><b>Manifest</b> {cur.manifest || '—'}</div>
           {cur.description && <div><b>Description</b> {cur.description}</div>}
-          <div><b>Here</b> {cur.status ? <a href="#" onClick={(e) => { e.preventDefault(); onPick(cur.version) }}><Badge value={cur.status} /></a>
-            : <span className="muted">Not uploaded yet</span>}</div>
+          <div><b>Here</b> {cur.status ? <a href="#" onClick={(e) => { e.preventDefault(); onPick(cur.version) }}><Badge value={cur.reuploading ? 're-uploading' : cur.status} /></a>
+            : <span className="muted">Not uploaded yet</span>}
+            {stored && <span className="muted small"> · stored {fmtTime(cur.uploaded_at)}{cur.uploaded_by ? ` by ${cur.uploaded_by}` : ''}{cur.revision > 1 ? ` · revision ${cur.revision}` : ''}</span>}</div>
         </div>
       )}
+      {stored && !cur.reuploading && <Msg warnings={[`${cur.version} is already stored here. Upload becomes Re-upload: use it after changing ${cur.manifest || 'the YML'}, re-pushing an image with the same tag or adding a service.${cur.manifest_changed ? ' The YML in this folder differs from the stored one.' : ''}`]} />}
       <Msg error={error || cur?.error || loadError} ok={ok} />
     </div>
   )
@@ -152,17 +180,25 @@ function UploadFile({ onPick, reloadList }) {
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
   const [busy, run] = useAction(setError)
+  const send = (replace) => {
+    if (file) {
+      const fd = new FormData()
+      fd.append('file', file)
+      return api(`/api/releases/upload${replace ? '?replace=true' : ''}`, { method: 'POST', form: fd })
+    }
+    return api('/api/releases/upload', { method: 'POST', body: { text, replace } })
+  }
   const upload = () => run(async () => {
     setError('')
     setResult(null)
     let res
     try {
-      if (file) {
-        const fd = new FormData()
-        fd.append('file', file)
-        res = await api('/api/releases/upload', { method: 'POST', form: fd })
-      } else {
-        res = await api('/api/releases/upload', { method: 'POST', body: { text } })
+      try {
+        res = await send(false)
+      } catch (e) {
+        if (!e.data?.exists) throw e
+        if (!await confirmReupload(e.data)) return
+        res = await send(true)
       }
     } catch (e) {
       setError(e.data?.errors ? e.data.errors.join('\n') : e.message)
@@ -191,7 +227,9 @@ function UploadFile({ onPick, reloadList }) {
         </label>
       </div>
       <div><button className="primary" disabled={busy || (!file && !text.trim())} onClick={upload}><Upload size={15} /> Upload</button></div>
-      <Msg error={error} ok={result?.ok && `Uploaded ${result.version} (${result.installers.length} services); checking, then storing…`}
+      <Msg error={error} ok={result?.ok && (result.reupload
+        ? `Re-uploading ${result.version} (${result.installers.length} services); the previous copy stays in use until it is stored again…`
+        : `Uploaded ${result.version} (${result.installers.length} services); checking, then storing…`)}
         warnings={result?.warnings} />
     </div>
   )
@@ -239,15 +277,16 @@ function OfficeReleases({ st, reload, loadError, onPick, reloadList }) {
                       {state === 'downloading' && p?.total ? <Progress done={p.done} total={p.total} /> : <Badge value={state} />}
                       {state === 'failed' && p?.error && <div className="sub bad-text">{p.error}</div>}
                       {state === 'conflict' && <div className="sub bad-text">A different release {r.version} is stored here</div>}
+                      {state === 'update' && <div className="sub">Re-uploaded at the office {fmtTime(r.uploaded_at)}; the copy here is from {fmtTime(r.local_uploaded_at)}</div>}
                     </td>
                     <td className="actions">
                       {state === 'downloaded' && <button className="sm" onClick={() => onPick(r.version)}>View</button>}
-                      {can('operator') && ['available', 'failed'].includes(state) && (
+                      {can('operator') && ['available', 'failed', 'update'].includes(state) && (
                         <button className="sm" disabled={busy} onClick={() => run(async () => {
                           setError('')
                           await api(`/api/central/${encodeURIComponent(r.version)}/download`, { method: 'POST' })
                           reload()
-                        })}><Download size={14} /> Download</button>
+                        })}><Download size={14} /> {state === 'update' ? 'Get update' : 'Download'}</button>
                       )}
                     </td>
                   </tr>
@@ -389,7 +428,9 @@ export default function Release() {
                     tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && pick(r.version)}>
                     <td><b>{r.version}</b></td>
                     <td>{r.software_name}</td>
-                    <td><Badge value={r.status} /></td>
+                    <td><Badge value={r.reuploading ? 're-uploading' : r.status} />
+                      {r.revision > 1 && <div className="sub">revision {r.revision}</div>}
+                      {r.progress?.reupload_error && <div className="sub bad-text" title={r.progress.reupload_error}>re-upload failed</div>}</td>
                     <td>{r.progress?.phase && r.status !== 'downloaded'
                       ? <Progress done={r.progress.done ?? 0} total={r.progress.total ?? 0} label={`${r.progress.phase} ${r.progress.done ?? 0}/${r.progress.total ?? 0}`} />
                       : <span className="muted">—</span>}</td>

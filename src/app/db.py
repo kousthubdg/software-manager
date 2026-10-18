@@ -59,6 +59,22 @@ def _connect() -> sqlite3.Connection:
 _conn = _connect()
 _conn.executescript(SCHEMA)
 
+# columns added after the first release; ADD COLUMN keeps existing rows
+_COLUMNS = {
+    "releases": {
+        "revision": "INTEGER NOT NULL DEFAULT 1",
+        "reupload_json": "TEXT NOT NULL DEFAULT ''",
+    },
+    "deployments": {
+        "installed_json": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+for _table, _cols in _COLUMNS.items():
+    _have = {r["name"] for r in _conn.execute(f"PRAGMA table_info({_table})").fetchall()}
+    for _col, _decl in _cols.items():
+        if _col not in _have:
+            _conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_decl}")
+
 
 @contextmanager
 def tx() -> Iterator[sqlite3.Connection]:

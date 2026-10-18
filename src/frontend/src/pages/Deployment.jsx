@@ -348,6 +348,39 @@ function UpdateModal({ dep, onClose, onJob }) {
   )
 }
 
+function ApplyChangesModal({ dep, onClose, onJob }) {
+  const ch = dep.release_changes
+  const [error, setError] = useState('')
+  const [busy, run] = useAction(setError)
+  const apply = (map) => run(async () => {
+    const r = await api(`/api/deployments/${dep.id}/update`, { method: 'POST', body: { version: dep.version, ...(map ? { map } : {}) } })
+    onJob(r.job)
+  })
+  const initial = { ...dep.map, nodes: (dep.map?.nodes || []).map((n) => ({ ...n, pods: n.pods.filter((p) => !ch.removed.includes(p)) })) }
+  return (
+    <Modal title={`Apply changes of ${dep.version} · ${dep.name}`} onClose={onClose} wide={ch.added.length > 0}
+      footer={!ch.added.length && <>
+        <button onClick={onClose}>Cancel</button>
+        <button className="primary" disabled={busy} onClick={() => apply(null)}>Apply changes</button>
+      </>}>
+      <p className="dialog-text">Release {dep.version} was re-uploaded {fmtTime(ch.uploaded_at)}{ch.uploaded_by ? ` by ${ch.uploaded_by}` : ''}.
+        Only these pods are touched; the others keep running.</p>
+      <div className="kv" style={{ marginBottom: 0 }}>
+        <div><b>Changed</b> {ch.changed.join(', ') || 'None'}</div>
+        <div><b>Added</b> {ch.added.join(', ') || 'None'}</div>
+        <div><b>Removed</b> {ch.removed.join(', ') || 'None'}</div>
+      </div>
+      <Msg info="The database is backed up first (pg_dump). The image tag stays the same, so a changed pod that fails its health check is not rolled back automatically; added pods are removed again." />
+      {ch.added.length > 0 && <>
+        <p className="dialog-text">Choose a node for each added pod:</p>
+        <MapEditor version={dep.version} initial={initial} depId={dep.id} alarmBase={dep.alarm_base_path} busy={busy}
+          submitLabel="Apply changes" onCancel={onClose} onSubmit={apply} />
+      </>}
+      <Msg error={error} />
+    </Modal>
+  )
+}
+
 function DeleteModal({ dep, onClose, onJob }) {
   const [confirm, setConfirm] = useState('')
   const [removeData, setRemoveData] = useState(false)
@@ -478,6 +511,12 @@ function DeploymentDetail({ id, onBack }) {
 
       {dep.busy_job && <Msg info={<>Job #{dep.busy_job} is running; actions are locked until it finishes. <a href="#"
         onClick={(e) => { e.preventDefault(); setJob(dep.busy_job) }}>View progress</a></>} />}
+      {dep.release_changes && (
+        <Msg warnings={[<span key="rc">Release {dep.version} was re-uploaded ({fmtTime(dep.release_changes.uploaded_at)}) and differs from what is running here:{' '}
+          {[['changed', 'changed'], ['added', 'added'], ['removed', 'removed']].filter(([k]) => dep.release_changes[k].length)
+            .map(([k, label]) => `${label} ${dep.release_changes[k].join(', ')}`).join(' · ')}.{' '}
+          {can('operator') && <button className="sm primary" disabled={locked} onClick={() => setModal('apply')}>Apply changes</button>}</span>]} />
+      )}
 
       <Card>
         <div className="kv" style={{ marginBottom: 0 }}>
@@ -525,6 +564,7 @@ function DeploymentDetail({ id, onBack }) {
       <Jobs depId={id} />
       <Wiring id={id} />
       {modal === 'update' && <UpdateModal dep={dep} onClose={() => setModal(null)} onJob={startJob} />}
+      {modal === 'apply' && dep.release_changes && <ApplyChangesModal dep={dep} onClose={() => setModal(null)} onJob={startJob} />}
       {modal === 'delete' && <DeleteModal dep={dep} onClose={() => setModal(null)} onJob={startJob} />}
       {modal === 'map' && (
         <Modal title={`Edit map · ${dep.name}`} onClose={() => setModal(null)} wide>

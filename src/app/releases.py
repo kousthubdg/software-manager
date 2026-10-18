@@ -64,6 +64,39 @@ def md5_file(p: Path) -> str:
     return h.hexdigest()
 
 
+def tar_image_id(p: Path) -> str:
+    """Image ID (config digest) of a docker-archive tar, i.e. what `docker load` will report ('' if unknown)."""
+    try:
+        with tarfile.open(p) as tf:
+            fh = tf.extractfile("manifest.json")
+            cfg = json.load(fh)[0]["Config"] if fh else ""
+    except (OSError, KeyError, IndexError, TypeError, ValueError, AttributeError, tarfile.TarError):
+        return ""
+    hexd = str(cfg).rsplit("/", 1)[-1].removesuffix(".json")
+    return f"sha256:{hexd}" if re.fullmatch(r"[0-9a-f]{64}", hexd) else ""
+
+
+def pod_fingerprints(resolved: Any) -> dict[str, str]:
+    """Per pod, what decides whether its running container must be replaced. The stored image.tar is rebuilt on
+    every download (new mtimes), so its md5 only counts when there is no registry digest or image ID."""
+    out: dict[str, str] = {}
+    for name, x in (resolved or {}).items():
+        if isinstance(x, dict):
+            image = x.get("digest") or x.get("image_id") or x.get("image_tar_md5") or ""
+            out[name] = f"{image}|{x.get('scripts_md5') or ''}|{x.get('datafile_md5') or ''}"
+    return out
+
+
+def content_sha256(manifest_sha256: str, resolved_json: str) -> str:
+    """Identity of what a stored release really contains: the manifest plus every pod's image / scripts / data.
+    Two copies of one version with the same value are interchangeable."""
+    try:
+        fp = pod_fingerprints(json.loads(resolved_json or "{}"))
+    except ValueError:
+        fp = {}
+    return hashlib.sha256(json.dumps([manifest_sha256, sorted(fp.items())]).encode()).hexdigest()
+
+
 def _fileserver_auth(src: str) -> Optional[tuple[str, str]]:
     base = (db.kv_get("fileserver_base_url", "") or "").rstrip("/")
     user = db.kv_get("fileserver_user", "") or ""
@@ -380,10 +413,16 @@ def source_list() -> dict:
                 except (OSError, UnicodeDecodeError) as exc:
                     m, errors = None, [f"{mf.name}: cannot read as UTF-8 text ({exc})"]
                 if m:
-                    r = db.one("SELECT status, software_name FROM releases WHERE version=?", m.software_version)
+                    r = db.one("SELECT status, software_name, uploaded_at, uploaded_by, revision, reupload_json, "
+                               "manifest_sha256 FROM releases WHERE version=?", m.software_version)
+                    mine = bool(r) and r["software_name"] == m.software_name
                     item.update(version=m.software_version, software_name=m.software_name,
                                 description=m.description, installers=len(m.installers),
-                                status=r["status"] if r and r["software_name"] == m.software_name else "")
+                                status=r["status"] if mine else "")
+                    if mine:
+                        item.update(uploaded_at=r["uploaded_at"], uploaded_by=r["uploaded_by"],
+                                    revision=r["revision"], reuploading=bool(r["reupload_json"]),
+                                    manifest_changed=r["status"] == "downloaded" and m.sha256 != r["manifest_sha256"])
                     if r and r["software_name"] != m.software_name:
                         item["error"] = f"version {m.software_version} is already used here by {r['software_name']}"
                 else:
@@ -403,8 +442,9 @@ def _source_folder(folder: str) -> Path:
     return d
 
 
-def import_source(folder: str, user: str, download: bool) -> dict:
-    """Upload the manifest from a release folder; scan, and download everything when download=True."""
+def import_source(folder: str, user: str, download: bool, replace: bool = False) -> dict:
+    """Upload the manifest from a release folder; scan, and download everything when download=True.
+    A version that is already downloaded is only taken again with replace=True (re-upload)."""
     d = _source_folder(folder)
     mf = _folder_manifest(d)
     if not mf:
@@ -420,7 +460,12 @@ def import_source(folder: str, user: str, download: bool) -> dict:
     if r and r["software_name"] != m.software_name:
         raise ScanError(f"version {m.software_version} already exists here for {r['software_name']}; "
                         "delete it first or use another version")
-    if r and r["status"] in ("downloaded", "downloading", "scanning"):
+    if r and r["status"] == "downloaded":
+        res = upload(text, user, then_download=True, replace=replace)
+        if not res.get("ok") and not res.get("exists"):
+            raise ScanError("; ".join(res.get("errors", [])))
+        return {**res, "status": "scanning"} if res.get("ok") else res
+    if r and r["status"] in ("downloading", "scanning"):
         return {"ok": True, "version": m.software_version, "status": r["status"]}
     if r and r["status"] in ("scanned", "download_failed") and json.loads(r["scan_json"] or "{}").get("ok"):
         started = download and start_bg(download_release, m.software_version)
@@ -515,7 +560,7 @@ def bundle_start(prereq: str, versions: list[str], user: str) -> str:
                     v = r["version"]
                     meta = {k: r[k] for k in ("version", "software_name", "description", "manifest_text",
                                               "manifest_sha256", "uploaded_by", "uploaded_at", "scan_json",
-                                              "resolved_json")}
+                                              "resolved_json", "revision")}
                     data = json.dumps(meta).encode()
                     info = tarfile.TarInfo(f"{top}/releases/{v}/release.json")
                     info.size, info.mtime = len(data), int(time.time())
@@ -551,6 +596,13 @@ def cleanup_partials() -> None:
             shutil.rmtree(p, ignore_errors=True)
         else:
             p.unlink(missing_ok=True)
+    for p in RELEASES.glob(".*.replaced"):
+        live = RELEASES / p.name[1:-len(".replaced")]
+        if live.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            log.info("restoring %s interrupted while being replaced", live.name)
+            p.rename(live)
 
 
 _import_lock = threading.Lock()
@@ -580,13 +632,24 @@ def _import_local() -> list[dict]:
                 raise ScanError(f"manifest in release.json is invalid: {'; '.join(errors)[:300]}")
             if m.software_version != v or m.sha256 != meta["manifest_sha256"]:
                 raise ScanError("release.json version / manifest_sha256 do not match its manifest")
-            old = db.one("SELECT software_name, manifest_sha256, status FROM releases WHERE version=?", v)
-            if old and old["manifest_sha256"] == meta["manifest_sha256"] and old["status"] == "downloaded":
+            old = db.one("SELECT * FROM releases WHERE version=?", v)
+            new_content = content_sha256(meta["manifest_sha256"], meta.get("resolved_json") or "{}")
+            if old and old["status"] == "downloaded" and \
+                    content_sha256(old["manifest_sha256"], old["resolved_json"]) == new_content:
                 shutil.rmtree(d, ignore_errors=True)
                 done.append({"version": v, "result": "already here"})
                 continue
+            if old and old["software_name"] == m.software_name and old["status"] == "downloaded" and \
+                    float(meta.get("uploaded_at") or 0) > float(old["uploaded_at"] or 0):
+                if not files.is_dir():
+                    raise ScanError(f"{d}: files/ missing")
+                done.append({"version": v, "result": _replace_stored(v, old, meta, m, files)})
+                if done[-1]["result"] == "updated":
+                    shutil.rmtree(d, ignore_errors=True)
+                continue
             if old:
-                done.append({"version": v, "result": f"skipped: version {v} already exists here ({old['software_name']})"})
+                done.append({"version": v, "result": f"skipped: version {v} already exists here ({old['software_name']}"
+                                                     f"{', a newer copy is stored here' if old['status'] == 'downloaded' else ''})"})
                 continue
             if not files.is_dir():
                 raise ScanError(f"{d}: files/ missing")
@@ -595,11 +658,12 @@ def _import_local() -> list[dict]:
             now = time.time()
             try:
                 db.ex("INSERT INTO releases(version,software_name,description,manifest_text,manifest_sha256,"
-                      "uploaded_by,uploaded_at,status,scan_json,progress_json,resolved_json,updated_at) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "uploaded_by,uploaded_at,status,scan_json,progress_json,resolved_json,updated_at,revision) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       v, m.software_name, m.description, meta["manifest_text"],
                       meta["manifest_sha256"], meta.get("uploaded_by", "import"), meta.get("uploaded_at", now),
-                      "downloaded", meta.get("scan_json") or "{}", "{}", meta.get("resolved_json") or "{}", now)
+                      "downloaded", meta.get("scan_json") or "{}", "{}", meta.get("resolved_json") or "{}", now,
+                      int(meta.get("revision") or 1))
             except Exception:
                 shutil.move(str(RELEASES / v), str(files))
                 raise
@@ -610,6 +674,40 @@ def _import_local() -> list[dict]:
             log.error("import %s failed: %s", d, exc)
             done.append({"version": d.name, "result": f"failed: {exc}"})
     return done
+
+
+def _replace_stored(v: str, old: dict, meta: dict, m: manifest.Manifest, files: Path) -> str:
+    """Swap the stored copy of version v for a newer upload of it (office catalog or USB package)."""
+    why = _reserve(v)
+    if why:
+        return f"skipped: {why}; it is taken on the next check"
+    try:
+        blocked = _reupload_blocked(v)
+        if blocked:
+            return f"skipped: {blocked}; it is taken on the next check"
+        remember_installed(v, old)
+        base, keep = RELEASES / v, RELEASES / f".{v}.replaced"
+        shutil.rmtree(keep, ignore_errors=True)
+        if base.exists():
+            base.rename(keep)
+        try:
+            shutil.move(str(files), str(base))
+            db.ex("UPDATE releases SET description=?, manifest_text=?, manifest_sha256=?, uploaded_by=?, uploaded_at=?, "
+                  "status='downloaded', scan_json=?, resolved_json=?, progress_json='{}', revision=?, reupload_json='', "
+                  "updated_at=? WHERE version=?",
+                  m.description, meta["manifest_text"], meta["manifest_sha256"], meta.get("uploaded_by", "import"),
+                  meta["uploaded_at"], meta.get("scan_json") or "{}", meta.get("resolved_json") or "{}",
+                  int(meta.get("revision") or (old.get("revision") or 1) + 1), time.time(), v)
+        except Exception:
+            shutil.rmtree(base, ignore_errors=True)
+            if keep.exists():
+                keep.rename(base)
+            raise
+        shutil.rmtree(keep, ignore_errors=True)
+        db.audit("system", "release_import", v, {"replaced": True, "uploaded_at": meta["uploaded_at"]})
+        return "updated"
+    finally:
+        _unreserve(v)
 
 
 def scan_then_download(version: str) -> None:
@@ -623,7 +721,28 @@ def download_release(version: str) -> None:
     download(version)
 
 
-def upload(text: str, user: str, then_download: bool = False) -> dict:
+REUPLOAD_KEEP = ("software_name", "description", "manifest_text", "manifest_sha256", "uploaded_by", "uploaded_at",
+                 "status", "scan_json", "resolved_json")
+
+
+def _reupload_blocked(version: str) -> str:
+    from . import deploy
+    for d in db.q("SELECT id, name FROM deployments WHERE version=?", version):
+        job = deploy.busy(d["id"])
+        if job:
+            return f"deployment '{d['name']}' is running job #{job}"
+    return ""
+
+
+def remember_installed(version: str, row: dict) -> None:
+    """Before stored content of a version changes, record what deployments on it were installed from (once)."""
+    snap = json.dumps({"manifest_text": row["manifest_text"], "resolved_json": row["resolved_json"] or "{}"})
+    db.ex("UPDATE deployments SET installed_json=? WHERE version=? AND installed_json=''", snap, version)
+
+
+def upload(text: str, user: str, then_download: bool = False, replace: bool = False) -> dict:
+    """replace=True re-uploads a downloaded version: the stored copy stays in use until the new one is
+    checked and downloaded; if that fails the stored copy is put back."""
     m, errors, warnings = manifest.parse(text)
     if not m:
         return {"ok": False, "errors": errors, "warnings": warnings}
@@ -632,14 +751,29 @@ def upload(text: str, user: str, then_download: bool = False) -> dict:
         return {"ok": False, "errors": [f"release {m.software_version}: {why}; try again when it has finished"],
                 "warnings": warnings}
     started = False
+    reupload = False
     try:
-        old = db.one("SELECT status, software_name FROM releases WHERE version=?", m.software_version)
+        old = db.one("SELECT * FROM releases WHERE version=?", m.software_version)
         if old and old["software_name"] != m.software_name:
             return {"ok": False, "errors": [f"version {m.software_version} already exists here for "
                                             f"{old['software_name']}"], "warnings": warnings}
-        if old and old["status"] in ("downloaded", "downloading", "scanning"):
-            return {"ok": False, "errors": [f"release {m.software_version} already exists ({old['status']}); releases "
-                                            "are immutable, ship a fix as a new software_version"], "warnings": warnings}
+        if old and old["status"] in ("downloading", "scanning"):
+            return {"ok": False, "errors": [f"release {m.software_version} is {old['status']}; try again when it "
+                                            "has finished"], "warnings": warnings}
+        reupload = bool(old) and old["status"] == "downloaded"
+        if reupload and not replace:
+            return {"ok": False, "exists": True, "version": m.software_version, "uploaded_at": old["uploaded_at"],
+                    "uploaded_by": old["uploaded_by"], "warnings": warnings,
+                    "errors": [f"release {m.software_version} is already uploaded; choose Re-upload to replace it"]}
+        if reupload:
+            blocked = _reupload_blocked(m.software_version)
+            if blocked:
+                return {"ok": False, "errors": [f"release {m.software_version} cannot be re-uploaded now: {blocked}"],
+                        "warnings": warnings}
+            remember_installed(m.software_version, old)
+            db.ex("UPDATE releases SET reupload_json=? WHERE version=?",
+                  json.dumps({k: old[k] for k in REUPLOAD_KEEP} | {"progress_json": old["progress_json"]}),
+                  m.software_version)
         now = time.time()
         db.ex("INSERT INTO releases(version,software_name,description,manifest_text,manifest_sha256,uploaded_by,"
               "uploaded_at,status,scan_json,progress_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -650,13 +784,69 @@ def upload(text: str, user: str, then_download: bool = False) -> dict:
               " progress_json='{}', updated_at=excluded.updated_at",
               m.software_version, m.software_name, m.description, text, m.sha256, user, now, "uploaded",
               json.dumps({"warnings": warnings}), "{}", now)
-        db.audit(user, "release_upload", m.software_version, {"sha256": m.sha256, "installers": len(m.installers)})
-        started = start_bg(scan_then_download if then_download else scan, m.software_version, reserved=True)
+        db.audit(user, "release_reupload" if reupload else "release_upload", m.software_version,
+                 {"sha256": m.sha256, "installers": len(m.installers)})
+        fn = _reupload_run if reupload else (scan_then_download if then_download else scan)
+        started = start_bg(fn, m.software_version, reserved=True)
     finally:
         if not started:
             _unreserve(m.software_version)
+            if reupload:
+                _restore_reupload(m.software_version, "the re-upload could not be started")
     return {"ok": True, "version": m.software_version, "sha256": m.sha256, "warnings": warnings,
-            "installers": [i.name for i in m.installers]}
+            "installers": [i.name for i in m.installers], "reupload": reupload}
+
+
+def _failure_reason(r: Optional[dict]) -> str:
+    if not r:
+        return "release row disappeared"
+    prog = json.loads(r["progress_json"] or "{}")
+    if prog.get("error"):
+        return str(prog["error"])
+    bad = []
+    for x in json.loads(r["scan_json"] or "{}").get("installers", []):
+        for key, c in (x.get("checks") or {}).items():
+            if not c.get("ok"):
+                bad.append(f"{x['name']} {key}: {c.get('error', 'failed')}")
+    return "; ".join(bad) or f"ended as {r['status']}"
+
+
+def _reupload_run(version: str) -> None:
+    err = ""
+    try:
+        scan_then_download(version)
+    except Exception as exc:
+        log.exception("re-upload of %s failed", version)
+        err = f"{type(exc).__name__}: {exc}"
+    r = db.one("SELECT * FROM releases WHERE version=?", version)
+    if r and r["status"] == "downloaded" and not err:
+        db.ex("UPDATE releases SET revision=revision+1, reupload_json='', updated_at=? WHERE version=?",
+              time.time(), version)
+        db.audit("system", "release_reupload", version, {"ok": True})
+    else:
+        _restore_reupload(version, err or _failure_reason(r))
+
+
+def _restore_reupload(version: str, reason: str) -> None:
+    """Put the previously stored copy back after a failed re-upload (its files were never touched)."""
+    r = db.one("SELECT reupload_json FROM releases WHERE version=?", version)
+    snap = json.loads(r["reupload_json"] or "{}") if r and r["reupload_json"] else {}
+    if not snap:
+        return
+    prog = {"reupload_error": reason[:1000], "reupload_failed_at": time.time()}
+    db.ex(f"UPDATE releases SET {', '.join(f'{k}=?' for k in REUPLOAD_KEEP)}, progress_json=?, reupload_json='', "
+          "updated_at=? WHERE version=?", *(snap[k] for k in REUPLOAD_KEEP), json.dumps(prog), time.time(), version)
+    db.audit("system", "release_reupload", version, {"ok": False, "error": reason[:1000]})
+    log.warning("re-upload of %s failed, previous copy kept: %s", version, reason)
+
+
+def recover_reuploads() -> None:
+    """At start-up: finish or undo re-uploads that a restart interrupted."""
+    for r in db.q("SELECT version, status FROM releases WHERE reupload_json<>''"):
+        if r["status"] == "downloaded" and (RELEASES / r["version"]).is_dir():
+            db.ex("UPDATE releases SET revision=revision+1, reupload_json='' WHERE version=?", r["version"])
+        else:
+            _restore_reupload(r["version"], "Software Manager restarted during the re-upload")
 
 
 def _reserve(version: str) -> str:
@@ -779,12 +969,12 @@ def download(version: str) -> None:
                     raise ScanError(f"{inst.name}: image tag was re-pushed after the scan "
                                     f"({sc['image']['digest']} -> {now})")
                 entry.update(digest=now, image_source="tar", image_tar_md5=md5_file(it),
-                             image_size=it.stat().st_size)
+                             image_size=it.stat().st_size, image_id=tar_image_id(it))
             else:
                 it = fetch(inst.image_tar_path, d / "image.tar")
                 if md5_file(it) != sc["image"]["md5"]:
                     raise ScanError(f"{inst.name}: image tar changed after the scan")
-                entry["image_tar_md5"] = sc["image"]["md5"]
+                entry.update(image_tar_md5=sc["image"]["md5"], image_id=tar_image_id(it))
             if inst.has_datafile:
                 dname = Path(inst.datafile_path.split("?")[0]).name or "datafile"
                 df = fetch(inst.datafile_path, d / "datafile" / dname)

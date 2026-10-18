@@ -182,6 +182,15 @@ reachable from the manager).
 **Stored releases**: select a version to see services, images, digests, sizes and status.
 The release path is never modified.
 
+**Re-upload the same version** (e.g. `V1.0.0` after an image was re-pushed with the same tag, a
+service was added to the YML, or a scripts tar changed): pick the same folder – the button becomes
+**Re-upload 1.0.0** and a dialog says *"You are re-uploading 1.0.0 (stored … by …)"*. Confirm, and
+everything is checked and stored again. The stored copy stays in use until the new one is ready;
+if the check or download fails, the stored copy is kept and the reason shows on the release
+(*Re-upload failed …*). A successful re-upload raises the **revision** shown next to the version.
+Uploading the same version from a YML file asks the same question. Deployments are not changed
+by a re-upload – see section 9.
+
 ---
 
 ## 6. Build the prerequisites package (for a branch / offline site)
@@ -248,8 +257,10 @@ Do this once; afterwards every release you upload at the office shows up at ever
    Release page asks immediately). New versions are **downloaded automatically** (images, scripts,
    datafiles, md5-checked) and then appear as `downloaded` in **Stored releases** and in the
    **Deployment** version dropdown. Card **Releases from the office** on the Release page shows
-   each version: *available*, *downloading %*, *downloaded*, *failed* (with reason), or *conflict*
-   (same version number but different content here – not touched).
+   each version: *available*, *downloading %*, *downloaded*, *failed* (with reason), *update*
+   (the office re-uploaded a version that is stored here; it is fetched again automatically, or
+   with **Get update**) or *conflict* (same version number but different content here and the
+   office copy is not newer – not touched).
 3. Installing / updating stays a manual click on the **Deployment** page.
 
 Set `SM_CENTRAL_AUTO_DOWNLOAD=false` to only list them; then use **Download** on each row.
@@ -284,6 +295,16 @@ Branches without any connection still use the USB package (sections 6 and 7).
    Deployment → select `1.0.1` → Update there. Branches without a connection: build a new prerequisites
    package with `1.0.1` ticked, run `prereq.sh --manager` again on the manager node (it only
    hands over the releases and restarts the manager if nothing else changed), then Update.
+
+**Same version changed (re-upload)**: push the image with the same tag (option 5) and/or edit the YML
+in the same folder, then **Re-upload** it (section 5). Each deployment on that version then shows
+*"Release 1.0.0 was re-uploaded … changed / added / removed …"* with **Apply changes**. Only those
+pods are touched: changed pods get the new image (the agent compares the image ID, so a re-pushed
+tag is loaded), added pods need a node in the dialog, removed pods are taken down. The database is
+backed up first; because the tag is the same, a changed pod that fails is not rolled back
+automatically (added pods are removed again). Branches get the re-upload as *update* (section 7a)
+and then show the same **Apply changes**. Branches without a connection: build a new
+prerequisites package with the version ticked and run `prereq.sh --manager` again.
 
 ---
 

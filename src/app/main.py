@@ -48,6 +48,7 @@ def _startup() -> None:
         db.ex("UPDATE releases SET status=? WHERE version=?",
               "uploaded" if r["status"] == "scanning" else "download_failed", r["version"])
     releases.cleanup_partials()
+    releases.recover_reuploads()
     for x in releases.import_local():
         log.info("release import %s: %s", x["version"], x["result"])
     health.start_thread()
@@ -151,8 +152,9 @@ def del_user(username: str, user: User = Depends(admin)) -> dict:
 def _rel_summary(r: dict) -> dict:
     scan = json.loads(r.get("scan_json") or "{}")
     return {k: r[k] for k in ("version", "software_name", "description", "manifest_sha256", "uploaded_by",
-                              "uploaded_at", "status", "updated_at")} | {
+                              "uploaded_at", "status", "updated_at", "revision")} | {
         "progress": json.loads(r.get("progress_json") or "{}"), "scan_ok": scan.get("ok"),
+        "reuploading": bool(r.get("reupload_json")),
         "used_by": [d["name"] for d in db.q("SELECT name FROM deployments WHERE version=? OR prev_version=?",
                                             r["version"], r["version"])],
     }
@@ -175,26 +177,29 @@ def get_release(version: str, _: User = Depends(viewer)) -> dict:
 
 class ManifestBody(BaseModel):
     text: str
+    replace: bool = False
 
 
 @app.post("/api/releases/upload")
-async def upload_release(request: Request, user: User = Depends(operator), file: Optional[UploadFile] = File(None)) -> dict:
+async def upload_release(request: Request, user: User = Depends(operator), file: Optional[UploadFile] = File(None),
+                         replace: bool = False) -> dict:
     if file is not None:
         raw = await file.read(2_000_001)
     else:
         try:
-            raw = ManifestBody(**(await request.json())).text.encode()
+            body = ManifestBody(**(await request.json()))
         except Exception:
             raise HTTPException(422, "send a manifest file (multipart 'file') or JSON {text}")
+        raw, replace = body.text.encode(), replace or body.replace
     if len(raw) > 2_000_000:
         raise HTTPException(413, "manifest too large")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise HTTPException(422, "manifest must be UTF-8 text")
-    res = await run_in_threadpool(releases.upload, text, user.name, True)
+    res = await run_in_threadpool(releases.upload, text, user.name, True, replace)
     if not res["ok"]:
-        return JSONResponse(res, status_code=422)
+        return JSONResponse(res, status_code=409 if res.get("exists") else 422)
     return res
 
 
@@ -205,15 +210,19 @@ def release_source(_: User = Depends(viewer)) -> dict:
 
 class ImportBody(BaseModel):
     download: bool = True
+    replace: bool = False
 
 
 @app.post("/api/release-source/{folder:path}/import")
-def release_source_import(folder: str, body: ImportBody, user: User = Depends(operator)) -> dict:
+def release_source_import(folder: str, body: ImportBody, user: User = Depends(operator)):
     try:
-        res = releases.import_source(folder, user.name, body.download)
+        res = releases.import_source(folder, user.name, body.download, body.replace)
     except releases.ScanError as exc:
         raise HTTPException(422, str(exc))
-    db.audit(user.name, "release_import", folder, {"download": body.download, "version": res.get("version")})
+    if res.get("exists"):
+        return JSONResponse(res, status_code=409)
+    db.audit(user.name, "release_import", folder, {"download": body.download, "version": res.get("version"),
+                                                   "replace": body.replace})
     return res
 
 
@@ -595,7 +604,8 @@ def _dep_out(d: dict) -> dict:
         st = next((p for p in json.loads(n.get("pods_json") or "[]") if p["name"] == name), {})
         pods.append({"name": name, "node_id": nid, "node": n.get("name"), "node_ip": n.get("ip"),
                      "port": deploy.pod_port(name, resolved, mp), "status": st})
-    return {**{k: v for k, v in d.items() if k != "map_json"}, "map": mp, "pods": pods, "busy_job": deploy.busy(d["id"])}
+    return {**{k: v for k, v in d.items() if k not in ("map_json", "installed_json")}, "map": mp, "pods": pods,
+            "busy_job": deploy.busy(d["id"]), "release_changes": deploy.pending_changes(d)}
 
 
 @app.get("/api/deployments")
@@ -685,8 +695,6 @@ class UpdateBody(BaseModel):
 @app.post("/api/deployments/{did}/update")
 def dep_update(did: int, body: UpdateBody, user: User = Depends(operator)) -> dict:
     d = _dep(did)
-    if body.version == d["version"]:
-        raise HTTPException(422, "already on this version")
     try:
         return {"job": deploy.wf_update(d, body.version, user.name, body.map)}
     except KeyError as exc:
